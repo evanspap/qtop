@@ -73,17 +73,12 @@ from qtop_py.constants import (
     SYSTEMCONFDIR,
     USERPATH,
 )
-from qtop_py.plugins.demo import DemoBatchSystem
-from qtop_py.plugins.oar import OARBatchSystem
-from qtop_py.plugins.pbs import PBSBatchSystem
-from qtop_py.plugins.sge import SGEBatchSystem
-from qtop_py.plugins.slurm import SlurmBatchSystem
-from qtop_py.serialiser import resolve_job_id
+from qtop_py.plugins import PLUGIN_BATCH_SYSTEMS, node_job_ids, node_state_symbol
+from qtop_py.serialiser import GenericBatchSystem, resolve_job_id
 from qtop_py.ui.viewport import Viewport
 from qtop_py.web import Web
 
 here = sys.path[0]
-PLUGIN_BATCH_SYSTEMS = (DemoBatchSystem, OARBatchSystem, PBSBatchSystem, SGEBatchSystem, SlurmBatchSystem)
 
 
 def reset_sigpipe():
@@ -137,14 +132,12 @@ def _reserved_pattern_mappings(config):
     }
 
 
+def scheduler_plugin(name):
+    return next((plugin for plugin in PLUGIN_BATCH_SYSTEMS if plugin.get_mnemonic() == name), GenericBatchSystem)
+
+
 def queue_is_blocked(state, scheduler_name=None):
-    """Return whether a queue state denotes blocking for the selected scheduler."""
-    state = str(state)
-    if scheduler_name == "sge":
-        return any(flag in state for flag in "aAcCdDEosSu")
-    if scheduler_name == "slurm" and state.lower() in ("down", "drain", "inact", "inactive"):
-        return True
-    return state.startswith("D") or state.endswith("S")
+    return scheduler_plugin(scheduler_name).queue_is_blocked(state)
 
 
 def compress_colored_line(value):
@@ -411,10 +404,9 @@ def finalize_filepaths_schedulercommands(args, config):
     for fn, path_command in config["schedulers"][scheduler].items():
         path, command = path_command.strip().split(", ")
         path = path % {"savepath": args.workdir, "pid": fn_append}
-        # Slurm format codes stay copyable; accept legacy escaped percent signs.
+        # Accept legacy escaped percent signs in command formats.
         command = command.replace("%%", "%").replace("%(savepath)s", args.workdir)
-        if scheduler == "slurm" and getattr(args, "ALL_PARTITIONS", False) and not args.SOURCEDIR and fn in ("squeue_file", "sinfo_file", "scontrol_file"):
-            command += " --all"
+        command = scheduler_plugin(scheduler).configure_command(fn, command, args)
         d[fn] = (path, command)
     return d
 
@@ -425,11 +417,11 @@ def auto_get_avail_batch_system(config):
     qtop tries to determine which of the known batch commands are available in the current system.
     """
     signature_commands = config["signature_commands"]
-    prioritized_commands = sorted(signature_commands.items(), key=lambda item: item[0] != "slurm")
+    prioritized_commands = sorted(signature_commands.items(), key=lambda item: -scheduler_plugin(item[0]).detection_priority)
     for system, batch_command in prioritized_commands:
         if not shutil.which(batch_command):
             continue
-        if system != "demo":
+        if scheduler_plugin(system).autodetect:
             logging.debug("Auto-detected scheduler: %s" % system)
             return system
 
@@ -565,6 +557,7 @@ def get_input_filenames(INPUT_FNs_commands, config):
     and results are saved with the respective filenames.
     """
 
+    plugin = scheduler_plugin(scheduler)
     filenames = dict()
     batch_system_commands = dict()
     for _file in INPUT_FNs_commands:
@@ -575,21 +568,23 @@ def get_input_filenames(INPUT_FNs_commands, config):
             try:
                 filenames[_file] = execute_shell_batch_commands(batch_system_commands, filenames, _file, _savepath)
             except OperationalError as error:
-                if scheduler != "slurm" or _file != "scontrol_file":
+                if _file not in plugin.optional_input_files:
                     raise
-                logging.warning("%s Using estimated Slurm CPU placement.", error)
+                logging.warning("%s %s", error, plugin.optional_input_warning)
                 filenames.pop(_file)
                 continue
 
-        if scheduler == "slurm" and _file == "scontrol_file" and not os.path.isfile(filenames[_file]):
+        if _file in plugin.optional_input_files and not os.path.isfile(filenames[_file]):
             filenames.pop(_file)
             continue
         if not os.path.isfile(filenames[_file]):
             raise OperationalError("Scheduler input file %s was not found. Check -s/--SetSourceDir and the selected scheduler." % filenames[_file])
-    if scheduler == "slurm" and args.SOURCEDIR and "scontrol_file" not in filenames:
-        detail_path = os.path.join(args.SOURCEDIR, "scontrol.txt")
-        if os.path.isfile(detail_path):
-            filenames["scontrol_file"] = detail_path
+    if args.SOURCEDIR:
+        for name, basename in plugin.optional_input_files.items():
+            if name not in filenames:
+                detail_path = os.path.join(args.SOURCEDIR, basename)
+                if os.path.isfile(detail_path):
+                    filenames[name] = detail_path
     return filenames
 
 
@@ -1356,9 +1351,9 @@ class WNOccupancy(object):
             node_attrs = self.cluster.workernode_dict[_node]
             # distribute state, qname etc to lines
             attribute = list(node_attrs[yaml_key][:min_len])
-            raw_state = node_attrs.get("slurm_node_state", "")
-            if yaml_key == "state" and raw_state and raw_state[-1] in "*+#~$@%!^-" and attribute:
-                attribute[0] = utils.ColorStr(raw_state[-1], color=attribute[0].color)
+            state_symbol = node_state_symbol(node_attrs) if yaml_key == "state" else ""
+            if state_symbol and attribute:
+                attribute[0] = utils.ColorStr(state_symbol, color=attribute[0].color)
             attribute.extend(" " for _ in range(min_len - len(attribute)))
             for attr_line, ch in zip(multiline_map, attribute):
                 if ch == " ":
@@ -1507,9 +1502,7 @@ class WNOccupancy(object):
     def _count_jobs_strict(worker_nodes, job_ids=None):
         jobs = set()
         for node in worker_nodes:
-            jobs.update(node["core_job_map"].values())
-            jobs.update(node.get("slurm_job_ids", []))
-            jobs.update(node.get("oar_job_ids", []))
+            jobs.update(node_job_ids(node))
         jobs.discard("?")
         if job_ids is not None:
             jobs = {resolve_job_id(job, job_ids) for job in jobs}
@@ -1556,8 +1549,7 @@ QDoc = namedtuple("QDoc", ["lm", "queued", "run", "state"])
 class Document(namedtuple("Document", ["worker_nodes", "jobs_dict", "queues_dict", "total_running_jobs", "total_queued_jobs"])):
     if TYPE_CHECKING:
         _job_metadata: Dict[str, Job]
-        _slurm_diagnostics: Dict[str, int]
-        _oar_diagnostics: Dict[str, int]
+        _snapshot_metadata: Dict[str, object]
 
     @classmethod
     def from_cluster_state(cls, cluster_state: "ClusterState") -> "Document":
@@ -1579,8 +1571,7 @@ class Document(namedtuple("Document", ["worker_nodes", "jobs_dict", "queues_dict
             totals["queued_jobs"],
         )
         document._job_metadata = {job["id"]: copy.deepcopy(job) for job in cluster_state["jobs"]}
-        document._slurm_diagnostics = copy.deepcopy(cluster_state.get("slurm_diagnostics", {}))
-        document._oar_diagnostics = copy.deepcopy(cluster_state.get("oar_diagnostics", {}))
+        document._snapshot_metadata = copy.deepcopy({key: value for key, value in cluster_state.items() if key not in ("jobs", "nodes", "queues")})
         return document
 
     def to_cluster_state(self) -> "ClusterState":
@@ -1607,11 +1598,7 @@ class Document(namedtuple("Document", ["worker_nodes", "jobs_dict", "queues_dict
                 for queue_name, queue in self.queues_dict.items()
             ],
         }
-        if getattr(self, "_slurm_diagnostics", {}):
-            state["slurm_diagnostics"] = copy.deepcopy(self._slurm_diagnostics)
-        if getattr(self, "_oar_diagnostics", {}):
-            state["oar_diagnostics"] = copy.deepcopy(self._oar_diagnostics)
-        return state
+        return {**copy.deepcopy(getattr(self, "_snapshot_metadata", {})), **state}
 
     def save(self, filename: str, cluster_state: "Optional[ClusterState]" = None) -> None:
         with open(filename, "w") as outfile:
@@ -1651,21 +1638,8 @@ class TextDisplay(object):
         if self.args.WATCH:
             print("\033c", end=" ")  # comma is to avoid losing the whole first line. An empty char still remains, though.
 
-        diagnostics = getattr(self.document, "_slurm_diagnostics", {})
-        if any(diagnostics.values()):
-            print(
-                "Slurm snapshot incomplete: %s rejected job rows; %s rejected node rows; "
-                "%s active jobs reference missing nodes; %s active jobs have invalid node lists."
-                % tuple(diagnostics.get(key, 0) for key in ("rejected_squeue_rows", "rejected_sinfo_rows", "jobs_with_missing_nodes", "jobs_with_invalid_nodelists"))
-            )
-
-        oar_notes = getattr(self.document, "_oar_diagnostics", {})
-        if any(oar_notes.values()):
-            print(
-                "OAR allocation notes: %s resources lack details; %s resources absent from node states; "
-                "%s job IDs absent from oarstat; %s shared resource slots (? marks unknown ownership)."
-                % tuple(oar_notes.get(key, 0) for key in ("missing_resources", "extra_resources", "unlisted_jobs", "shared_resources"))
-            )
+        for note in scheduler_plugin(scheduler).snapshot_notes(getattr(self.document, "_snapshot_metadata", {})):
+            print(note)
 
         for idx, part in enumerate(config["user_display_parts"], 1):
             display_func, opts = display_parts[part][0], display_parts[part][1]
@@ -1699,7 +1673,7 @@ class TextDisplay(object):
                 "version": __version__,
             }
         )
-        if scheduler == "demo":
+        if scheduler_plugin(scheduler).simulated:
             msg = "This data is simulated. As soon as you connect to one of the supported scheduling systems,\nyou will see live data from your cluster. Press q to Quit."
             print(colorize(msg, "Blue_L"))
 
@@ -1729,10 +1703,8 @@ class TextDisplay(object):
             }
         )
 
-        if scheduler == "slurm":
-            print("Slurm job counts include individual array tasks and heterogeneous components.")
-            if any(len(job.get("slurm_partitions", [])) > 1 for job in getattr(document, "_job_metadata", {}).values()):
-                print("Slurm partition counts include each eligible partition; global job counts are unique.")
+        for note in scheduler_plugin(scheduler).job_summary_notes(getattr(document, "_job_metadata", {}).values()):
+            print(note)
         expanded = globals().get("dynamic_config", {}).get("queue_summary_expanded", getattr(self.args, "EXPAND_QUEUES", False))
         print("%(queues)s :" % {"queues": colorize("Queueing", "Cyan_L")}, end="\n" if expanded else " ")
         for _queue_name, q_tuple in qstatq_lod.items():
@@ -1748,10 +1720,7 @@ class TextDisplay(object):
                 ),
                 end="\n" if expanded else " ",
             )
-        blocked_note = " (at least one queue instance)" if scheduler == "sge" else ""
-        if scheduler == "slurm":
-            blocked_note = " (partition closed to submissions or scheduling)"
-        print(colorize("* implies blocked", "Red") + blocked_note + "\n")
+        print(colorize("* implies blocked", "Red") + scheduler_plugin(scheduler).blocked_queue_note + "\n")
         if getattr(self.args, "SHOW_QUEUE_NODES", False):
             from qtop_py.queue_nodes import queue_node_counts
 
@@ -1770,20 +1739,13 @@ class TextDisplay(object):
         print_char_stop = self.wns_occupancy.print_char_stop
 
         self.display_basic_legend()
-        if scheduler == "slurm":
-            sources = {node.get("cpu_allocation_source") for node in cluster.worker_nodes}
-            if "estimated" in sources:
-                print("Slurm CPU placement: estimated where allocation details are unavailable.")
-            if "slurm" in sources:
-                print("Slurm CPU placement: scheduler CPU IDs; Linux task affinity is not shown.")
-            omitted = sum(node.get("slurm_unmapped_cpus", 0) for node in cluster.worker_nodes)
-            if omitted:
-                print("Slurm CPU matrix omits %s shared/excess CPU assignments; job/node membership is retained." % omitted)
+        for note in scheduler_plugin(scheduler).allocation_notes(cluster.worker_nodes):
+            print(note)
         self.display_matrix(wns_occupancy, print_char_start, print_char_stop)
         # the transposed matrix is one continuous block, doesn't make sense to break into more matrices
         if not dynamic_config.get("transpose_wn_matrices", config["transpose_wn_matrices"]):
             self.display_remaining_matrices(wns_occupancy, print_char_start, print_char_stop)
-        if scheduler == "slurm" and self.config.get("experimental_gpu_pairs"):
+        if scheduler_plugin(scheduler).supports_gpu_pairs and self.config.get("experimental_gpu_pairs"):
             from qtop_py.gpu import configured_pair_lines
 
             try:
@@ -2418,10 +2380,7 @@ class Cluster(object):
 
     def _calculate_jobs_per_node(self, workernode_dict):
         for node in workernode_dict:
-            node_job_set = set(workernode_dict[node]["core_job_map"].values())
-            node_job_set.update(workernode_dict[node].get("slurm_job_ids", []))
-            node_job_set.update(workernode_dict[node].get("oar_job_ids", []))
-            workernode_dict[node]["node_job_set"] = node_job_set
+            workernode_dict[node]["node_job_set"] = node_job_ids(workernode_dict[node])
 
 
 def colorize(text, color_func=None, pattern="NoPattern", mapping=None, bg_color=None, bold=False):
@@ -2730,7 +2689,7 @@ def main():
     SAMPLE_FILENAME = "qtop_sample_anonymous%(datetime)s.tar" if args.ANONYMIZE else os.path.expandvars(SAMPLE_FILENAME)
     if args.REPLAY:
         args.WATCH = 2  # enforce that --watch mode is on, even if not in cmdline switch
-        args.BATCH_SYSTEM = "demo"
+        args.BATCH_SYSTEM = next(plugin.get_mnemonic() for plugin in PLUGIN_BATCH_SYSTEMS if plugin.simulated)
         try:
             config, _, _ = load_yaml_config()
         except (ValueError, TypeError, KeyError, IndexError, AttributeError, StopIteration) as error:

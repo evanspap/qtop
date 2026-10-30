@@ -275,6 +275,59 @@ class SlurmStatExtractor(StatExtractor):
 
 
 class SlurmBatchSystem(GenericBatchSystem):
+    detection_priority = 1
+    supports_gpu_pairs = True
+    optional_input_files = {"scontrol_file": "scontrol.txt"}
+    optional_input_warning = "Using estimated Slurm CPU placement."
+    blocked_queue_note = " (partition closed to submissions or scheduling)"
+    node_job_id_field = "slurm_job_ids"
+
+    @staticmethod
+    def configure_command(name, command, options):
+        if getattr(options, "ALL_PARTITIONS", False) and not options.SOURCEDIR and name in ("squeue_file", "sinfo_file", "scontrol_file"):
+            command += " --all"
+        return command
+
+    @staticmethod
+    def queue_is_blocked(state):
+        return str(state).lower() in ("down", "drain", "inact", "inactive") or GenericBatchSystem.queue_is_blocked(state)
+
+    @staticmethod
+    def node_state_symbol(node):
+        state = node.get("slurm_node_state", "")
+        return state[-1] if state and state[-1] in "*+#~$@%!^-" else ""
+
+    @staticmethod
+    def snapshot_notes(metadata):
+        diagnostics = metadata.get("slurm_diagnostics", {})
+        if not any(diagnostics.values()):
+            return []
+        return [
+            "Slurm snapshot incomplete: %s rejected job rows; %s rejected node rows; "
+            "%s active jobs reference missing nodes; %s active jobs have invalid node lists."
+            % tuple(diagnostics.get(key, 0) for key in ("rejected_squeue_rows", "rejected_sinfo_rows", "jobs_with_missing_nodes", "jobs_with_invalid_nodelists"))
+        ]
+
+    @staticmethod
+    def job_summary_notes(jobs):
+        notes = ["Slurm job counts include individual array tasks and heterogeneous components."]
+        if any(len(job.get("slurm_partitions", [])) > 1 for job in jobs):
+            notes.append("Slurm partition counts include each eligible partition; global job counts are unique.")
+        return notes
+
+    @staticmethod
+    def allocation_notes(nodes):
+        notes = []
+        sources = {node.get("cpu_allocation_source") for node in nodes}
+        if "estimated" in sources:
+            notes.append("Slurm CPU placement: estimated where allocation details are unavailable.")
+        if "slurm" in sources:
+            notes.append("Slurm CPU placement: scheduler CPU IDs; Linux task affinity is not shown.")
+        omitted = sum(node.get("slurm_unmapped_cpus", 0) for node in nodes)
+        if omitted:
+            notes.append("Slurm CPU matrix omits %s shared/excess CPU assignments; job/node membership is retained." % omitted)
+        return notes
+
     # Bound both numeric ranges and Cartesian products from untrusted traces.
     MAX_EXPANDED_NODES = 100000
     ACTIVE_STATES = set(["R", "CG", "CF", "S", "ST", "RS", "SI", "SO"])

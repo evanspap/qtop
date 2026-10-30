@@ -63,6 +63,19 @@ def test_document_round_trip_and_save_use_cluster_state(tmp_path):
     assert json.loads(output.read_text()) == state
 
 
+@pytest.mark.parametrize("field, counter", [("slurm_diagnostics", "rejected_squeue_rows"), ("oar_diagnostics", "unlisted_jobs")])
+def test_document_preserves_snapshot_metadata_without_sharing_it(field, counter):
+    state = sample_state()
+    state[field] = {counter: 1}
+    document = Document.from_cluster_state(state)
+    assert document.to_cluster_state() == state
+    state[field][counter] = 2
+    restored = document.to_cluster_state()
+    assert restored[field] == {counter: 1}
+    restored[field][counter] = 3
+    assert document.to_cluster_state()[field] == {counter: 1}
+
+
 @pytest.mark.parametrize(
     "invalid",
     (

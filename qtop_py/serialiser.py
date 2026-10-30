@@ -114,6 +114,40 @@ class StatExtractor(object):
 
 
 class GenericBatchSystem(object):
+    detection_priority = 0
+    autodetect = True
+    simulated = False
+    supports_gpu_pairs = False
+    optional_input_files: Dict[str, str] = {}
+    optional_input_warning = ""
+    blocked_queue_note = ""
+    node_job_id_field = None
+
+    @staticmethod
+    def configure_command(name, command, options):
+        return command
+
+    @staticmethod
+    def queue_is_blocked(state):
+        state = str(state)
+        return state.startswith("D") or state.endswith("S")
+
+    @staticmethod
+    def node_state_symbol(node):
+        return ""
+
+    @staticmethod
+    def snapshot_notes(metadata):
+        return []
+
+    @staticmethod
+    def job_summary_notes(jobs):
+        return []
+
+    @staticmethod
+    def allocation_notes(nodes):
+        return []
+
     def __init__(self):
         pass
 

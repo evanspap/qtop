@@ -136,6 +136,12 @@ class SGEStatExtractor(StatExtractor):
 
 
 class SGEBatchSystem(GenericBatchSystem):
+    blocked_queue_note = " (at least one queue instance)"
+
+    @staticmethod
+    def queue_is_blocked(state):
+        return any(flag in str(state) for flag in "aAcCdDEosSu")
+
     @staticmethod
     def get_mnemonic():
         return "sge"

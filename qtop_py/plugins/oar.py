@@ -50,6 +50,19 @@ class OarStatExtractor(StatExtractor):
 
 
 class OARBatchSystem(GenericBatchSystem):
+    node_job_id_field = "oar_job_ids"
+
+    @staticmethod
+    def snapshot_notes(metadata):
+        diagnostics = metadata.get("oar_diagnostics", {})
+        if not any(diagnostics.values()):
+            return []
+        return [
+            "OAR allocation notes: %s resources lack details; %s resources absent from node states; "
+            "%s job IDs absent from oarstat; %s shared resource slots (? marks unknown ownership)."
+            % tuple(diagnostics.get(key, 0) for key in ("missing_resources", "extra_resources", "unlisted_jobs", "shared_resources"))
+        ]
+
     @staticmethod
     def get_mnemonic():
         return "oar"

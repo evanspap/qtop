@@ -5,6 +5,7 @@ See the [roadmap](ROADMAP.md#now-validate-and-deliver-10) for 1.0 release gates.
 
 ## 0.9.20261020
 
+- Refactor: delegate scheduler-specific runtime behavior to plugins.
 - Bugfix: (pbs) mark stopped queues; parse JSON job counts by state name.
 - Bugfix: (pbs) preserve wrapped allocations, array IDs and legacy job/queue records.
 - Bugfix: (pbs) tolerate invalid optional GPU counts.

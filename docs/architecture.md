@@ -98,6 +98,17 @@ flowchart TB
    `-R` replays saved rendered frames. The experimental `-B` web interface
    serves exported JSON and requires `-e`; these are distinct output paths.
 
+## Backend hooks
+
+Register backends in [plugins/__init__.py](../qtop_py/plugins/__init__.py).
+`GenericBatchSystem` supplies defaults for queue blocking, command adjustment,
+optional inputs, detection priority and display notes. Override these hooks in
+the backend instead of branching on scheduler names in `qtop.py`.
+`node_job_id_field` preserves job membership beyond CPU placement;
+`node_state_symbol()` supplies an optional display marker. Snapshot metadata
+passes through `Document` without interpreting scheduler-specific fields.
+The hooks run locally and add no scheduler queries.
+
 ## Source map
 
 | Responsibility | Source |
